@@ -38,6 +38,28 @@ jobs:
           } | tee runtime.log
           xcrun simctl boot "$UDID" 2>&1 | tee -a runtime.log
           xcrun simctl bootstatus "$UDID" -b 2>&1 | tee -a runtime.log
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('/tmp/widevine_stub.s').write_text(r'''
+          .text
+          .p2align 2
+          .globl __ZN8widevine3Cdm10initializeENS0_16SecureOutputTypeERKNS0_10ClientInfoEPNS0_8IStorageEPNS0_6IClockEPNS0_6ITimerENS0_8LogLevelE
+          __ZN8widevine3Cdm10initializeENS0_16SecureOutputTypeERKNS0_10ClientInfoEPNS0_8IStorageEPNS0_6IClockEPNS0_6ITimerENS0_8LogLevelE:
+              mov x0, #0
+              ret
+          .globl __ZN8widevine3Cdm6createEPNS0_14IEventListenerEPNS0_8IStorageEb
+          __ZN8widevine3Cdm6createEPNS0_14IEventListenerEPNS0_8IStorageEb:
+              mov x0, #0
+              ret
+          ''')
+          PY
+          WIDEVINE="$APP/Frameworks/widevine_cdm_secured_ios.framework/widevine_cdm_secured_ios"
+          xcrun clang -target arm64-apple-ios16.0-simulator -dynamiclib /tmp/widevine_stub.s \
+            -Wl,-install_name,@rpath/widevine_cdm_secured_ios.framework/widevine_cdm_secured_ios \
+            -o "$WIDEVINE" 2>&1 | tee -a runtime.log
+          file "$WIDEVINE" | tee -a runtime.log
+          vtool -show-build "$WIDEVINE" | tee -a runtime.log
+          nm -gU "$WIDEVINE" | tee widevine-symbols.log
           codesign --force --deep --sign - "$APP" 2>&1 | tee -a runtime.log
           echo "codesign_rc=${PIPESTATUS[0]}" | tee -a runtime.log
           xcrun simctl install "$UDID" "$APP" 2>&1 | tee -a runtime.log
@@ -73,6 +95,7 @@ jobs:
             runner-architecture.log
             macho-platform.log
             runtime.log
+            widevine-symbols.log
             launchctl.log
             simulator-system.log
             screenshot.png
