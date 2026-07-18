@@ -1,0 +1,87 @@
+name: Hermes patched YouTube Simulator test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator-runtime:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download and verify simulator IPA
+        run: |
+          set -euxo pipefail
+          curl --fail --location 'https://github.com/dolphinsflight/YTLite/releases/download/ytbetterplus-21.13.6-simulator-experimental/YTBetterPlus_21.13.6-5.2b4_SIMULATOR_EXPERIMENTAL.ipa' -o app.ipa
+          echo '1fb79b43958c56829016bf7cab64fa24b9227c857408fdc80096ed0312907189  app.ipa' | shasum -a 256 -c -
+          unzip -q app.ipa -d extracted
+          uname -m | tee runner-architecture.log
+          vtool -show-build extracted/Payload/YouTube.app/YouTube | tee macho-platform.log
+
+      - name: Boot, sign, install and run
+        id: runtime
+        continue-on-error: true
+        run: |
+          set +e
+          APP="$GITHUB_WORKSPACE/extracted/Payload/YouTube.app"
+          BUNDLE='com.google.ios.youtube'
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin)["runtimes"] if x.get("isAvailable") and x["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS-")]; print(r[-1]["identifier"])')
+          TYPE='com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro-Max'
+          UDID=$(xcrun simctl create HermesPatchedYT "$TYPE" "$RUNTIME")
+          trap 'xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true; xcrun simctl delete "$UDID" >/dev/null 2>&1 || true' EXIT
+          {
+            echo "runner_arch=$(uname -m)"
+            echo "runtime=$RUNTIME"
+            echo "udid=$UDID"
+          } | tee runtime.log
+          xcrun simctl boot "$UDID" 2>&1 | tee -a runtime.log
+          xcrun simctl bootstatus "$UDID" -b 2>&1 | tee -a runtime.log
+          codesign --force --deep --sign - "$APP" 2>&1 | tee -a runtime.log
+          echo "codesign_rc=${PIPESTATUS[0]}" | tee -a runtime.log
+          xcrun simctl install "$UDID" "$APP" 2>&1 | tee -a runtime.log
+          INSTALL_RC=${PIPESTATUS[0]}
+          echo "install_rc=$INSTALL_RC" | tee -a runtime.log
+          xcrun simctl launch "$UDID" "$BUNDLE" 2>&1 | tee -a runtime.log
+          LAUNCH_RC=${PIPESTATUS[0]}
+          echo "launch_rc=$LAUNCH_RC" | tee -a runtime.log
+          sleep 15
+          xcrun simctl io "$UDID" screenshot screenshot.png 2>&1 | tee -a runtime.log
+          xcrun simctl spawn "$UDID" launchctl print gui/501 > launchctl.log 2>&1
+          python3 - <<'PY' | tee -a runtime.log
+          from pathlib import Path
+          s=Path('launchctl.log').read_text(errors='replace')
+          present='com.google.ios.youtube' in s
+          print(f'bundle_present_in_launchctl={str(present).lower()}')
+          Path('alive.code').write_text('0\n' if present else '1\n')
+          PY
+          xcrun simctl spawn "$UDID" log show --last 2m --style compact --predicate 'process == "YouTube" OR eventMessage CONTAINS[c] "com.google.ios.youtube" OR eventMessage CONTAINS[c] "YouTube"' > simulator-system.log 2>&1
+          if [ $INSTALL_RC -eq 0 ] && [ $LAUNCH_RC -eq 0 ] && [ "$(cat alive.code)" = 0 ]; then
+            echo 0 > result.code
+            exit 0
+          fi
+          echo 1 > result.code
+          exit 1
+
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-youtube-simulator-evidence
+          path: |
+            runner-architecture.log
+            macho-platform.log
+            runtime.log
+            launchctl.log
+            simulator-system.log
+            screenshot.png
+            alive.code
+            result.code
+          if-no-files-found: warn
+
+      - name: Enforce result
+        if: always()
+        run: |
+          test -f result.code
+          test "$(cat result.code)" = 0
