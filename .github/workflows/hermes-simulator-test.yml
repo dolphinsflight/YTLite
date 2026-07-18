@@ -1,0 +1,92 @@
+name: Hermes iOS Simulator runtime test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator-test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download hardened IPA
+        run: |
+          set -euxo pipefail
+          curl --fail --location \
+            'https://github.com/dolphinsflight/YTLite/releases/download/ytbetterplus-21.13.6-free-hardened/YTBetterPlus_21.13.6-5.2b4_HARDENED_SideloadFixed.ipa' \
+            -o app.ipa
+          echo '49044af4660a70c341022a96d19bd1b8d87d22413004a82c41e4d16973efbde2  app.ipa' | shasum -a 256 -c -
+          unzip -q app.ipa -d extracted
+
+      - name: Inspect device and simulator compatibility
+        run: |
+          set -euxo pipefail
+          APP="$GITHUB_WORKSPACE/extracted/Payload/YouTube.app"
+          {
+            echo '=== Xcode ==='
+            xcodebuild -version
+            echo '=== Main executable ==='
+            file "$APP/YouTube"
+            lipo -info "$APP/YouTube"
+            vtool -show-build "$APP/YouTube" || true
+            echo '=== YTLite executable ==='
+            file "$APP/Frameworks/YTLite.dylib"
+            lipo -info "$APP/Frameworks/YTLite.dylib"
+            vtool -show-build "$APP/Frameworks/YTLite.dylib" || true
+            echo '=== Available runtimes ==='
+            xcrun simctl list runtimes
+          } | tee compatibility.log
+
+      - name: Boot simulator and attempt install and launch
+        id: runtime
+        continue-on-error: true
+        run: |
+          set +e
+          APP="$GITHUB_WORKSPACE/extracted/Payload/YouTube.app"
+          BUNDLE_ID='com.google.ios.youtube'
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin)["runtimes"] if x.get("isAvailable") and x["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS-")]; print(r[-1]["identifier"] if r else "")')
+          DEVICE_TYPE=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devicetypes"]; preferred=[x for x in d if "iPhone 16 Pro" in x["name"]]; print((preferred or d)[-1]["identifier"])')
+          echo "runtime=$RUNTIME" | tee simulator.log
+          echo "device_type=$DEVICE_TYPE" | tee -a simulator.log
+          UDID=$(xcrun simctl create HermesYTTest "$DEVICE_TYPE" "$RUNTIME" 2>&1)
+          CREATE_RC=$?
+          echo "create_rc=$CREATE_RC udid=$UDID" | tee -a simulator.log
+          if [ $CREATE_RC -ne 0 ]; then echo 1 > result.code; exit 1; fi
+          trap 'xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true; xcrun simctl delete "$UDID" >/dev/null 2>&1 || true' EXIT
+          xcrun simctl boot "$UDID" 2>&1 | tee -a simulator.log
+          xcrun simctl bootstatus "$UDID" -b 2>&1 | tee -a simulator.log
+          codesign --force --deep --sign - "$APP" 2>&1 | tee -a simulator.log
+          SIGN_RC=${PIPESTATUS[0]}
+          echo "codesign_rc=$SIGN_RC" | tee -a simulator.log
+          xcrun simctl install "$UDID" "$APP" 2>&1 | tee -a simulator.log
+          INSTALL_RC=${PIPESTATUS[0]}
+          echo "install_rc=$INSTALL_RC" | tee -a simulator.log
+          if [ $INSTALL_RC -eq 0 ]; then
+            xcrun simctl launch --console-pty "$UDID" "$BUNDLE_ID" 2>&1 | tee -a simulator.log
+            LAUNCH_RC=${PIPESTATUS[0]}
+          else
+            LAUNCH_RC=125
+          fi
+          echo "launch_rc=$LAUNCH_RC" | tee -a simulator.log
+          if [ $INSTALL_RC -eq 0 ] && [ $LAUNCH_RC -eq 0 ]; then echo 0 > result.code; exit 0; fi
+          echo 1 > result.code
+          exit 1
+
+      - name: Upload simulator evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ytbetterplus-simulator-evidence
+          path: |
+            compatibility.log
+            simulator.log
+            result.code
+          if-no-files-found: warn
+
+      - name: Enforce runtime result
+        if: always()
+        run: |
+          test -f result.code
+          test "$(cat result.code)" = '0'
