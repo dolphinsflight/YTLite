@@ -26,6 +26,7 @@ jobs:
         run: |
           set +e
           APP="$GITHUB_WORKSPACE/extracted/Payload/YouTube.app"
+          export APP
           BUNDLE='com.google.ios.youtube'
           RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin)["runtimes"] if x.get("isAvailable") and x["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS-")]; print(r[-1]["identifier"])')
           TYPE='com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro-Max'
@@ -60,8 +61,32 @@ jobs:
           file "$WIDEVINE" | tee -a runtime.log
           vtool -show-build "$WIDEVINE" | tee -a runtime.log
           nm -gU "$WIDEVINE" | tee widevine-symbols.log
-          codesign --force --deep --sign - "$APP" 2>&1 | tee -a runtime.log
-          echo "codesign_rc=${PIPESTATUS[0]}" | tee -a runtime.log
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          app = Path(os.environ['APP'])
+          paths=[]
+          for p in app.rglob('*'):
+              if not p.is_file():
+                  continue
+              try:
+                  if p.read_bytes()[:4] == b'\xcf\xfa\xed\xfe':
+                      p.chmod(0o755)
+                      paths.append(str(p))
+              except OSError:
+                  pass
+          Path('/tmp/macho-paths.txt').write_text('\n'.join(sorted(paths))+'\n')
+          print(f'macho_sign_targets={len(paths)}')
+          PY
+          while IFS= read -r BIN; do
+            [ "$BIN" = "$APP/YouTube" ] && continue
+            codesign --force --sign - "$BIN" 2>&1 | tee -a runtime.log
+          done < /tmp/macho-paths.txt
+          codesign --force --sign - "$APP/YouTube" 2>&1 | tee -a runtime.log
+          codesign --force --sign - "$APP" 2>&1 | tee -a runtime.log
+          codesign --verify --deep --strict --verbose=4 "$APP" 2>&1 | tee -a runtime.log
+          VERIFY_RC=${PIPESTATUS[0]}
+          echo "codesign_verify_rc=$VERIFY_RC" | tee -a runtime.log
           xcrun simctl install "$UDID" "$APP" 2>&1 | tee -a runtime.log
           INSTALL_RC=${PIPESTATUS[0]}
           echo "install_rc=$INSTALL_RC" | tee -a runtime.log
